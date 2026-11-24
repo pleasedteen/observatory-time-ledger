@@ -64,7 +64,14 @@ def cmd_rerun(args) -> int:
             changed[source] = {p for p in parts.split(",") if p}
     report = pipe.rerun(changed_partitions=changed, note="cli rerun")
     _print(report.to_dict())
-    return 0 if report.status == "ok" else 1
+    if report.status == "error":
+        return 1
+    if report.outcome == "superseded":
+        # fencing worked: stale solve refused, current version stays in place
+        print(f"RERUN SUPERSEDED: {report.detail}", file=sys.stderr)
+    elif report.outcome == "unchanged":
+        print(f"NO NEW VERSION: {report.detail}", file=sys.stderr)
+    return 0
 
 
 def cmd_query(args) -> int:

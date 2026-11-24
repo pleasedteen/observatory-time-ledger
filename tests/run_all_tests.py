@@ -3,11 +3,13 @@
 
 Exits non-zero on the first failure. Covers the Parquet codec, max-flow
 bounds (including exhaustive random verification), parsers/quarantine,
-and the full ingestion/rerun/query/snapshot/idempotency lifecycle.
+the full ingestion/rerun/query/snapshot/idempotency lifecycle, and the
+multi-process publication-consistency suite (fencing + crash recovery).
 """
 import os
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -211,12 +213,28 @@ def test_lifecycle():
     shutil.rmtree(work, ignore_errors=True)
 
 
+def test_publication_consistency():
+    print("[publication consistency: interleaved publish + crash recovery]")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "test_publication_consistency.py")
+    proc = subprocess.run([sys.executable, "-I", script],
+                          capture_output=True, text=True, timeout=80)
+    # surface the readable per-scenario output even on success
+    print(proc.stdout)
+    if proc.returncode != 0:
+        print(proc.stderr, file=sys.stderr)
+    check(proc.returncode == 0,
+          "fencing rejects stale runs; mid-publish crashes stay recoverable; "
+          "incremental reruns never reuse wrong-version lineage")
+
+
 def main():
     t0 = time.time()
     test_parquet()
     test_maxflow()
     test_parsers()
     test_lifecycle()
+    test_publication_consistency()
     print(f"\nALL TESTS PASSED in {time.time() - t0:.2f}s ({PASS} assertions)")
 
 

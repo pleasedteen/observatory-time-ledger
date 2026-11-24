@@ -10,19 +10,46 @@ Workflow
    the allowed pairs and union-find groups, and recomputes ONLY the groups
    whose inputs changed. Groups whose input hash is unchanged keep their
    previously published result (business result and lineage stay identical).
-3. Publish one complete immutable version and atomically swap the ``current``
-   pointer, so a query always sees a whole version; a crash mid-publish leaves
-   the last complete version readable and the rerun can simply be repeated.
+3. Publication is fenced by the monotonic input epoch captured when the run
+   started. A slow run whose inputs went stale while it was solving is
+   refused at commit time instead of overwriting a newer published version;
+   identical-input reruns collapse to the already-published version. The
+   two-phase commit (staged ledger row + lineage, version tree + atomic
+   pointer swap, then ``current`` marker) keeps every readable snapshot
+   whole even if the process stops mid-publish.
 """
 from __future__ import annotations
 
+import os
+import time
 import uuid
 
 from . import parsers
 from .parsers import (SOURCE_DEVICE, SOURCE_SCHEDULE, SOURCE_LEDGER,
                       ParsedPartition)
 from .reconcile import build_pairs, reconcile_groups
-from .storage import Lake, canonical_json, sha256_bytes, utc_now
+from .storage import Lake, PublicationSuperseded, canonical_json, sha256_bytes, utc_now
+
+
+# ---------------------------------------------------------------------- #
+# fault-injection hooks (offline tests only; driven by RECON_FAULT_* env)
+# ---------------------------------------------------------------------- #
+def maybe_fault(point: str) -> None:
+    """Trigger a test fault when RECON_FAULT=<point>[,...] names this point.
+
+    Supported actions via RECON_FAULT_ACTION:
+      * ``exit``     hard process stop (os._exit, no cleanup) -> crash
+      * ``sleep:N``  block N seconds -> a slow, long-running solve
+    """
+    wanted = os.environ.get("RECON_FAULT", "")
+    if point not in {p.strip() for p in wanted.split(",") if p.strip()}:
+        return
+    action = os.environ.get("RECON_FAULT_ACTION", "exit")
+    if action == "exit":
+        # emulate a hard kill mid-publish: no finally/atexit runs
+        os._exit(91)
+    if action.startswith("sleep:"):
+        time.sleep(float(action.split(":", 1)[1]))
 
 
 class IngestionReport:
@@ -34,12 +61,20 @@ class IngestionReport:
         self.affected_groups = []
         self.version_id = None
         self.status = "running"
+        # "ok": newly published; "unchanged": inputs already published;
+        # "superseded": stale inputs, publication refused
+        self.outcome = "ok"
+        self.detail = ""
+        self.input_epoch = None
 
     def to_dict(self):
         return {
             "run_id": self.run_id,
             "status": self.status,
+            "outcome": self.outcome,
+            "detail": self.detail,
             "version_id": self.version_id,
+            "input_epoch": self.input_epoch,
             "accepted": self.accepted,
             "voided": self.voided,
             "quarantine_count": len(self.quarantine),
@@ -119,17 +154,30 @@ class Pipeline:
 
     def rerun(self, changed_partitions: dict | None = None,
               note: str = "") -> IngestionReport:
-        """Recompute and publish.
+        """Recompute and publish with epoch fencing.
 
         ``changed_partitions`` optionally maps source -> set(partition) that
         were touched in this run; only groups depending on them are rebuilt.
         When None, every group is recomputed (but unchanged groups still
         produce identical hashes/results).
+
+        Outcomes:
+          * ``ok``          - a new immutable version was published;
+          * ``unchanged``   - the exact input state is already published;
+          * ``superseded``  - newer inputs landed during the solve, so the
+            stale result was refused and the current version stays in place.
         """
         run_id = uuid.uuid4().hex
         report = IngestionReport(run_id)
         self.lake.start_run(run_id, note)
         try:
+            # fence: pin the accepted input state this run computes from.
+            # No write lock is held while the (potentially long) solve runs,
+            # so ingestion and another rerun can complete concurrently.
+            start_epoch = self.lake.current_input_epoch()
+            report.input_epoch = start_epoch
+            maybe_fault("before_solve")
+
             device_recs, schedule_recs, ledger_recs = self.load_accepted()
 
             device_index, project_index, pair_lineage, night_period = \
@@ -139,13 +187,16 @@ class Pipeline:
             all_docs = reconcile_groups(
                 pairs, device_index, project_index, pair_lineage,
                 night_period)
+            maybe_fault("after_solve")
 
             # decide which groups are affected by the changed partitions
             changed_keys = self._changed_group_keys(
                 all_docs, changed_partitions)
             report.affected_groups = sorted(changed_keys)
 
-            # reuse prior results for unaffected groups; recompute the rest
+            # reuse prior results for unaffected groups; recompute the rest.
+            # group_version() only sees lineage attached to the CURRENT
+            # publication, so staged/superseded runs can never poison reuse.
             prior_docs = {d["group_id"]: d
                           for d in self.lake.read_all_group_docs()}
             group_docs, quarantine_docs = {}, {}
@@ -178,20 +229,62 @@ class Pipeline:
                 q["quarantine_id"] = qid
                 quarantine_docs[qid] = q
 
-            manifest = self._manifest(run_id, group_docs, report)
-            version_id = self.lake.next_version_id()
-            self.lake.publish_version(version_id, manifest, group_docs,
-                                      quarantine_docs)
-            for gid, doc in group_docs.items():
-                self.lake.record_group_version(
-                    gid, version_id, doc["input_hash"], doc["result_hash"],
-                    run_id)
+            fingerprint = self.lake.input_fingerprint()
+
+            # phase 1: fenced reservation in a single SQLite transaction
+            try:
+                reservation = self.lake.reserve_publication(
+                    run_id, start_epoch, fingerprint)
+            except PublicationSuperseded as exc:
+                report.status = "superseded"
+                report.outcome = "superseded"
+                report.detail = exc.reason
+                report.version_id = exc.current_version_id
+                self.lake.finish_run(run_id, "superseded")
+                return report
+
+            if reservation["status"] == "unchanged":
+                # identical input state is already published: idempotent
+                # no-op, keep the existing complete version untouched.
+                report.status = "unchanged"
+                report.outcome = "unchanged"
+                report.version_id = reservation["version_id"]
+                report.detail = (
+                    "input fingerprint already published as version "
+                    f"v{reservation['version_id']}; no new version written")
+                self.lake.finish_run(run_id, "unchanged")
+                return report
+
+            version_id = reservation["version_id"]
+            manifest = self._manifest(run_id, group_docs, report,
+                                      start_epoch, fingerprint)
+            maybe_fault("after_reserve")
+            try:
+                # durable lineage rows bound to the reserved (staged) version
+                for gid, doc in group_docs.items():
+                    self.lake.record_group_version(
+                        gid, version_id, doc["input_hash"],
+                        doc["result_hash"], run_id)
+
+                # phase 2a: full version tree, then atomic pointer swap
+                self.lake.write_version_tree(
+                    version_id, manifest, group_docs, quarantine_docs)
+                maybe_fault("after_tree_write")
+
+                # phase 2b: durable commit marker
+                self.lake.commit_publication(version_id)
+            except Exception:
+                self.lake.abort_publication(version_id)
+                raise
 
             report.version_id = version_id
             report.status = "ok"
+            report.outcome = "ok"
             self.lake.finish_run(run_id, "ok")
         except Exception as exc:
             report.status = "error"
+            report.outcome = "error"
+            report.detail = str(exc)
             self.lake.finish_run(run_id, "error")
             raise
         return report
@@ -271,18 +364,21 @@ class Pipeline:
         return {k: v for k, v in doc.items()
                 if k not in ("run_id", "input_hash", "result_hash")}
 
-    def _manifest(self, run_id, group_docs, report):
+    def _manifest(self, run_id, group_docs, report, input_epoch,
+                  input_fingerprint):
         statuses = {}
         for d in group_docs.values():
             statuses[d["status"]] = statuses.get(d["status"], 0) + 1
         return {
             "run_id": run_id,
             "published_at": utc_now(),
+            "input_epoch": input_epoch,
+            "input_fingerprint": input_fingerprint,
             "group_count": len(group_docs),
             "status_counts": statuses,
             "groups": sorted(group_docs.keys()),
             "ingestion": report.to_dict(),
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
 

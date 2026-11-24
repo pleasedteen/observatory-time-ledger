@@ -70,7 +70,8 @@ JSON 对象 `{设备代码: 规范接收机}`，或对象数组
 
 ### 6.2 版本目录 `versions/v<id>/`
 
-- `current.json`：版本清单（run_id、发布时间、组计数、状态计数、组 id 列表、接入报告）。
+- `current.json`：版本清单（run_id、发布时间、`input_epoch`、`input_fingerprint`、
+  组计数、状态计数、组 id 列表、接入报告；`schema_version=2`）。
 - `groups/<group_id>.json`：组结果，含 `status`、`nights`、`pairs`、`totals`、
   `pair_results`、`by_night`、`lineage`、`input_hash`、`result_hash`。
 - `quarantine/<qid>.json`：被拒绝记录，含 `source/partition/source_path/location/raw/reason`。
@@ -78,13 +79,19 @@ JSON 对象 `{设备代码: 规范接收机}`，或对象数组
 ### 6.3 current 指针
 
 `current` 为指向最新完整版本目录的符号链接；文件系统不支持符号链接时退化为含绝对路径的
-原子指针文件。读取方只解析该指针，因此读到的永远是一个完整版本。
+原子指针文件。读取方只解析该指针，因此读到的永远是一个完整版本。版本目录先在
+`.stage-*` 临时目录中写全并原子改名，指针切换是唯一对读者可见的变更。
 
 ### 6.4 SQLite `state.db`
 
 - `ingests(source, partition)`：当前生效分区的 blob、来源路径、字节数、接入时间、run。
-- `runs(run_id)`：运行生命周期。
-- `group_versions(group_id, version_id)`：每组的输入/结果哈希与血缘版本。
+- `runs(run_id)`：运行生命周期（含 `superseded`/`unchanged` 结局）。
+- `meta`：单行键值，`input_epoch` 为单调递增的接入纪元（每次有效接入 +1）。
+- `publications(version_id)`：发布台账，状态机 `staged -> current -> abandoned`；
+  含围栏用的 `input_epoch`/`input_fingerprint`。恢复时与 current 指针对账裁决。
+- `group_versions(group_id, version_id)`：每组的输入/结果哈希与血缘版本；
+  复用查询只 JOIN `publications.state='current'` 的行，staged/abandoned 行不可见。
+- `quarantine(qid)`：持久化、内容去重的隔离记录历史。
 
 ## 7. 状态语义
 

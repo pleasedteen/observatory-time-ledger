@@ -38,12 +38,14 @@ recon/
   storage.py     内容寻址 blob、SQLite 台账、原子版本目录与 current 指针（快照隔离）
   parsers.py     GB18030 CSV / UTF-8 JSONL / Parquet 解析、校验、隔离记录
   reconcile.py   配对生成、并查集分组（可跨夜）、合计核对、min/max 计算
-  pipeline.py    整批替换接入、隔离作废、受影响组增量重算、幂等发布
+  pipeline.py    整批替换接入、隔离作废、受影响组增量重算、围栏幂等发布（epoch CAS + 两阶段提交）
   query.py       只读查询（组/夜/项目/接收机、确定值、区间、血缘）
   fixtures.py    自带离线夹具生成器
   selftest.py    端到端自检
 recon_cli.py     统一入口（适配 python3 -I 隔离模式）
-tests/run_all_tests.py   一键测试（49 项断言，约 0.1 秒）
+tests/run_all_tests.py   一键测试（50 项断言，约 3.5 秒）
+tests/test_publication_consistency.py
+                 多进程交错发布与中断恢复离线测试（36 项断言，80 秒时限内约 3.5 秒）
 examples/receiver_map.json
 docs/FORMATS.md  输入输出格式详细说明
 ```
@@ -58,14 +60,20 @@ docs/FORMATS.md  输入输出格式详细说明
 python3 -I tests/run_all_tests.py
 ```
 
+只跑发布一致性专题（真实多进程交错 + 硬停机恢复，可读的逐场景结果）：
+
+```bash
+python3 -I tests/test_publication_consistency.py
+```
+
 或查看带完整业务输出的端到端演示：
 
 ```bash
 python3 -I recon_cli.py demo
 ```
 
-两者都在约 0.1 秒内完成，自动生成临时夹具、跑通接入/重跑/查询/隔离/崩溃恢复/离线对账，
-结束后清理临时目录。加 `--keep` 可保留临时数据湖路径以便人工查看。
+测试在约 3.5 秒内完成，自动生成临时夹具、跑通接入/重跑/查询/隔离/交错发布/
+崩溃恢复/离线对账，结束后清理临时目录。加 `--keep` 可保留临时数据湖路径以便人工查看。
 
 > 使用 `-I`（隔离模式）运行：忽略环境变量与当前目录，避免被不可信目录中的同名模块影响。
 
@@ -133,7 +141,7 @@ N1,DEV-B,4000
     groups/<group_id>.json                     每个核对组的完整结果
     quarantine/<qid>.json                      被拒绝记录及原因
   current -> versions/v<id>                    原子符号链接（不支持时为指针文件）
-  state.db                                     SQLite：接入/运行/组版本血缘
+  state.db                                     SQLite：接入/运行/版本发布台账（publications）/组版本血缘
 ```
 
 组结果文档（`groups/<group_id>.json`）关键字段：
@@ -222,11 +230,22 @@ python3 -I recon_cli.py --lake ./lake ingest --source device \
 3. **同时满足两侧合计**：可行性建模为有上下界的整数流（Dinic + 超级源汇环流），
    min/max 经精确边界搜索得到，随机网络已用穷举法对照验证。
 4. **共享合计成组、可跨夜**：并查集按共享设备合计或项目结算合计连通。
-5. **增量重跑**：仅重算输入发生变化的组；输入未变的组沿用已发布结果，
+5. **增量重跑**：仅重算输入发生变化的组；输入未变的组沿用**当前发布版本**的
+   结果（血缘查询只认 `publications.state='current'` 的行），中断/被取代版本
+   的血缘对复用不可见，绝不会把错版结果带进下一次增量重跑；
    `input_hash`/`result_hash` 不变，业务结果与血缘稳定。
-6. **幂等**：blob 内容寻址，相同输入产生相同哈希；重复重跑结果一致。
-7. **快照隔离**：先写完整版本目录，再原子切换 `current`；跨夜查询只读一个完整版本。
-8. **崩溃恢复**：发布中途停机，`current` 仍指向上一完整版本；可直接再次重跑发布新版本。
+6. **幂等与发布围栏**：blob 内容寻址，相同输入产生相同哈希；每次接入推进单调
+   `input_epoch`，rerun 起跑时捕获 epoch，提交时在 SQLite 事务内 CAS 校验——
+   慢旧求解即便在更新的输入批次生效后才结束，也只会得到 `superseded` 拒绝而
+   无法覆盖当前版；相同输入的并发重跑收敛为 `unchanged`，不产生重复版本。
+   长求解不持写锁（WAL + busy timeout），求解期间接入与另一轮重跑均可完成。
+7. **快照隔离 + 两阶段崩溃恢复**：先提交 `staged` 版本预留与组血缘（已持久化、
+   读者不可见），再写完整版本目录并原子切换 `current`，最后把预留标记为
+   `current`。发布中途任何位置停机，查询都只读到一个完整版本；重开数据湖时
+   `recover_publications()` 按 `current` 指针裁决：指针已切到的 staged 提升为
+   current，其余 staged 判为 abandoned，临时 `.stage-*` 目录自动清理，可直接重跑。
+8. **崩溃恢复**：发布中途停机，`current` 仍指向上一完整版本（或指针已切到的
+   完整新版本）；可直接再次重跑发布新版本，不会出现半发布目录或悬挂血缘。
 9. **离线对账**：原始文件下线后，所有已接收分区仍以 blob 形式可重算、可对账。
 10. **血缘可查**：每组可追溯用到的输入文件与每条原始记录位置。
 
