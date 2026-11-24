@@ -16,13 +16,14 @@ Workflow
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 from . import parsers
 from .parsers import (SOURCE_DEVICE, SOURCE_SCHEDULE, SOURCE_LEDGER,
                       ParsedPartition)
 from .reconcile import build_pairs, reconcile_groups
-from .storage import Lake, canonical_json, sha256_bytes, utc_now
+from .storage import Lake, canonical_json, sha256_bytes, sha256_file, utc_now
 
 
 class IngestionReport:
@@ -34,9 +35,10 @@ class IngestionReport:
         self.affected_groups = []
         self.version_id = None
         self.status = "running"
+        self.retention_report = None
 
     def to_dict(self):
-        return {
+        out = {
             "run_id": self.run_id,
             "status": self.status,
             "version_id": self.version_id,
@@ -45,10 +47,20 @@ class IngestionReport:
             "quarantine_count": len(self.quarantine),
             "affected_groups": self.affected_groups,
         }
+        if self.retention_report is not None:
+            out["retention"] = (
+                self.retention_report.to_dict()
+                if hasattr(self.retention_report, "to_dict")
+                else dict(self.retention_report)
+            )
+        return out
 
 
 class Pipeline:
-    def __init__(self, lake: Lake, receiver_map: dict) -> None:
+    def __init__(self, lake: Lake | str | os.PathLike[str],
+                 receiver_map: dict) -> None:
+        if not isinstance(lake, Lake):
+            lake = Lake(os.fspath(lake))
         self.lake = lake
         self.receiver_map = receiver_map
 
@@ -57,35 +69,49 @@ class Pipeline:
     # ------------------------------------------------------------------ #
     def ingest(self, source: str, partition: str, path: str,
                run_id: str, report: IngestionReport) -> ParsedPartition | None:
-        if source == SOURCE_DEVICE:
-            parsed = parsers.parse_device(path, partition, self.receiver_map)
-        elif source == SOURCE_SCHEDULE:
-            parsed = parsers.parse_schedule(path, partition)
-        elif source == SOURCE_LEDGER:
-            parsed = parsers.parse_ledger(path, partition)
-        else:
-            raise ValueError(f"unknown source {source!r}")
+        write_lease = self.lake.acquire_lease(
+            "write", "partition", f"{source}:{partition}")
+        try:
+            if source == SOURCE_DEVICE:
+                parsed = parsers.parse_device(path, partition, self.receiver_map)
+            elif source == SOURCE_SCHEDULE:
+                parsed = parsers.parse_schedule(path, partition)
+            elif source == SOURCE_LEDGER:
+                parsed = parsers.parse_ledger(path, partition)
+            else:
+                raise ValueError(f"unknown source {source!r}")
 
-        if not parsed.ok:
-            # replacement is void: do NOT touch the existing accepted
-            # partition; persist rejected rows to durable quarantine at once
-            # so they survive even if no rerun follows.
-            for q in parsed.quarantine:
-                doc = q.to_dict()
-                qid = _quarantine_id(doc)
-                doc["quarantine_id"] = qid
-                doc["run_id"] = run_id
-                self.lake.add_quarantine(qid, doc)
-                report.quarantine.append(doc)
-            report.voided.append((source, partition, len(parsed.quarantine)))
-            return None
+            if not parsed.ok:
+                # replacement is void: do NOT touch the existing accepted
+                # partition; persist rejected rows to durable quarantine at once
+                # so they survive even if no rerun follows.
+                for q in parsed.quarantine:
+                    doc = q.to_dict()
+                    qid = _quarantine_id(doc)
+                    doc["quarantine_id"] = qid
+                    doc["run_id"] = run_id
+                    self.lake.add_quarantine(qid, doc)
+                    report.quarantine.append(doc)
+                report.voided.append((source, partition, len(parsed.quarantine)))
+                return None
 
-        blob_sha, _, byte_size = self.lake.store_file_blob(path)
-        self.lake.record_ingest(source, partition, blob_sha, path,
-                                byte_size, run_id)
-        report.accepted.append((source, partition, blob_sha,
-                                len(parsed.records)))
-        return parsed
+            # Hold the blob lock across content placement and the catalog
+            # commit so retention cannot observe and delete a newly received
+            # blob in the store -> ingests-table window.
+            prospective_sha = sha256_file(path)
+            blob_lease = self.lake.acquire_lease(
+                "write", "blob", prospective_sha)
+            try:
+                blob_sha, _, byte_size = self.lake.store_file_blob(path)
+                self.lake.record_ingest(source, partition, blob_sha, path,
+                                        byte_size, run_id)
+            finally:
+                blob_lease.release()
+            report.accepted.append((source, partition, blob_sha,
+                                    len(parsed.records)))
+            return parsed
+        finally:
+            write_lease.release()
 
     # ------------------------------------------------------------------ #
     # rebuild indices from accepted blobs and recompute affected groups
@@ -118,7 +144,11 @@ class Pipeline:
         return device_recs, schedule_recs, ledger_recs
 
     def rerun(self, changed_partitions: dict | None = None,
-              note: str = "") -> IngestionReport:
+              note: str = "", keep_versions: int | None = None,
+              retention: bool | int | None = None,
+              retain: int | None = None,
+              keep: int | None = None,
+              run_gc: bool = False) -> IngestionReport:
         """Recompute and publish.
 
         ``changed_partitions`` optionally maps source -> set(partition) that
@@ -129,8 +159,12 @@ class Pipeline:
         run_id = uuid.uuid4().hex
         report = IngestionReport(run_id)
         self.lake.start_run(run_id, note)
+        write_lease = self.lake.acquire_lease("write", "lake", "rerun")
         try:
             device_recs, schedule_recs, ledger_recs = self.load_accepted()
+            input_blob_shas = sorted({
+                row["blob_sha"] for row in self.lake.all_ingests()
+            })
 
             device_index, project_index, pair_lineage, night_period = \
                 self._build_indices(device_recs, schedule_recs, ledger_recs)
@@ -179,9 +213,11 @@ class Pipeline:
                 quarantine_docs[qid] = q
 
             manifest = self._manifest(run_id, group_docs, report)
+            manifest["input_blobs"] = input_blob_shas
             version_id = self.lake.next_version_id()
             self.lake.publish_version(version_id, manifest, group_docs,
                                       quarantine_docs)
+            self.lake.record_version_blobs(version_id, input_blob_shas)
             for gid, doc in group_docs.items():
                 self.lake.record_group_version(
                     gid, version_id, doc["input_hash"], doc["result_hash"],
@@ -190,11 +226,43 @@ class Pipeline:
             report.version_id = version_id
             report.status = "ok"
             self.lake.finish_run(run_id, "ok")
+            write_lease.release()
+
+            auto_gc = getattr(self.lake, "auto_retention", False)
+            if keep_versions is not None or retention is not None or \
+                    retain is not None or keep is not None or run_gc or auto_gc:
+                from .retention import run_retention
+                if isinstance(retention, int) and not isinstance(retention, bool):
+                    keep_gc = retention
+                elif keep_versions is not None:
+                    keep_gc = keep_versions
+                elif retain is not None:
+                    keep_gc = retain
+                elif keep is not None:
+                    keep_gc = keep
+                else:
+                    keep_gc = getattr(self.lake,
+                                      "default_keep_versions", None) or 3
+                report.retention_report = run_retention(
+                    self.lake, keep_versions=keep_gc)
         except Exception as exc:
             report.status = "error"
             self.lake.finish_run(run_id, "error")
+            write_lease.release()
             raise
         return report
+
+    # ------------------------------------------------------------------ #
+    # retention / garbage collection delegation
+    # ------------------------------------------------------------------ #
+    def retention(self, keep_versions: int | None = None, **kwargs):
+        from .retention import run_retention
+        return run_retention(self.lake, keep_versions=keep_versions, **kwargs)
+
+    retain = retention
+    gc = retention
+    cleanup = retention
+    collect_garbage = retention
 
     # ------------------------------------------------------------------ #
     def _build_indices(self, device_recs, schedule_recs, ledger_recs):
@@ -231,6 +299,7 @@ class Pipeline:
                     pair_lineage.setdefault(triple, []).append({
                         "source": SOURCE_SCHEDULE,
                         "source_path": rec.get("_source_path"),
+                        "blob_sha": rec.get("_blob_sha"),
                         "location": rec.get("_line"),
                         "ref": list(triple),
                     })
@@ -284,6 +353,17 @@ class Pipeline:
             "ingestion": report.to_dict(),
             "schema_version": 1,
         }
+
+
+def retain_versions(lake, keep_versions: int | None = 3, **kwargs):
+    """Functional alias for :meth:`Pipeline.retention`."""
+    if not isinstance(lake, Lake):
+        lake = Lake(os.fspath(lake))
+    return Pipeline(lake, kwargs.pop("receiver_map", {})).retention(
+        keep_versions, **kwargs)
+
+
+collect_garbage = retain_versions
 
 
 def _quarantine_id(q: dict) -> str:

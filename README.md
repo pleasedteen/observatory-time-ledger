@@ -39,11 +39,13 @@ recon/
   parsers.py     GB18030 CSV / UTF-8 JSONL / Parquet 解析、校验、隔离记录
   reconcile.py   配对生成、并查集分组（可跨夜）、合计核对、min/max 计算
   pipeline.py    整批替换接入、隔离作废、受影响组增量重算、幂等发布
-  query.py       只读查询（组/夜/项目/接收机、确定值、区间、血缘）
+  query.py       只读查询与可加租约的旧版本 Snapshot
+  retention.py   最近 N 版保留、引用确认、读/写租约保护与可恢复 GC
+  gc.py          retention.py 的常用别名入口
   fixtures.py    自带离线夹具生成器
   selftest.py    端到端自检
 recon_cli.py     统一入口（适配 python3 -I 隔离模式）
-tests/run_all_tests.py   一键测试（49 项断言，约 0.1 秒）
+tests/run_all_tests.py   一键测试（78 项断言，约 0.4 秒）
 examples/receiver_map.json
 docs/FORMATS.md  输入输出格式详细说明
 ```
@@ -133,7 +135,8 @@ N1,DEV-B,4000
     groups/<group_id>.json                     每个核对组的完整结果
     quarantine/<qid>.json                      被拒绝记录及原因
   current -> versions/v<id>                    原子符号链接（不支持时为指针文件）
-  state.db                                     SQLite：接入/运行/组版本血缘
+  locks/                                       读共享/写与 GC 排他的 flock 文件
+  state.db                                     SQLite：接入/运行/租约/GC 台账
 ```
 
 组结果文档（`groups/<group_id>.json`）关键字段：
@@ -202,6 +205,18 @@ python3 -I recon_cli.py --lake ./lake lineage g858c4901fc1601da
 python3 -I recon_cli.py --lake ./lake quarantine
 python3 -I recon_cli.py --lake ./lake summary
 python3 -I recon_cli.py --lake ./lake snapshot
+
+# 只保留最近 3 个发布版，回收确认无引用的旧快照/原件副本
+python3 -I recon_cli.py --lake ./lake retention --keep 3
+python3 -I recon_cli.py --lake ./lake gc 2 --dry-run   # 预演；gc/cleanup/retain 同义
+```
+
+Python API 可用 `lake.open_snapshot(1)` 固定并共享锁定旧版；上下文退出后该版才可回收：
+
+```python
+with lake.open_snapshot(1) as old:
+    old.query_pairs()       # 可暂停在旧版并继续读完
+    lake.retain_versions(2) # 同时清理其它无引用版本和 blob
 ```
 
 接入非法文件时进程以退出码 `2` 结束，打印隔离原因，**该次替换作废**，旧分区保留：
@@ -229,6 +244,19 @@ python3 -I recon_cli.py --lake ./lake ingest --source device \
 8. **崩溃恢复**：发布中途停机，`current` 仍指向上一完整版本；可直接再次重跑发布新版本。
 9. **离线对账**：原始文件下线后，所有已接收分区仍以 blob 形式可重算、可对账。
 10. **血缘可查**：每组可追溯用到的输入文件与每条原始记录位置。
+11. **发布保留与安全回收**：`retention --keep N` 保留最近 N 个完整发布版和
+    `current`；活动读租约固定的旧版、保留版 `input_blobs`/血缘中的原件、
+    当前 `ingests` 中已接收（含尚未重跑发布）的分区、活动写租约目标均不删除。
+12. **只回收可确认无引用原件**：每个接入 blob 的来源/分区追加记录在
+    `ingest_history`；只有来源明确、且不被任何受保护版本、当前分区或租约引用的
+    blob 才删除。磁盘上存在但来源/归属不明的旧 blob 一律保留并在报告
+    `unknown_blobs` 中列出。
+13. **旧查询不被清理打断**：`lake.open_snapshot(vid)` /
+    `QueryService(lake, version_id=vid)` 建立 SQLite 租约和 per-version
+    共享 `flock`；GC 用非阻塞排他锁二次确认。暂停在旧版期间，该版及其 blob
+    受保护，其它废弃版本/blob 仍可清理；关闭快照后租约释放。
+14. **中断可续跑**：GC 删除项写入 `gc_runs/gc_items`，每个删除动作幂等；
+    中途异常或进程退出后，再次执行 `retention`/`gc` 会调和未完成日志并继续。
 
 ---
 
@@ -239,6 +267,9 @@ python3 -I recon_cli.py --lake ./lake ingest --source device \
 - 跨 N1/N2 的可行组：N1 为 2×2 配对产生真实 min<max 区间，N2 为确定值；
 - N3 的 GAMMA 组：初始缺设备合计 → `pending`，摄入修正文件后变 `feasible`；
 - N4 的 DELTA 组：设备合计与项目合计冲突 → `isolated`；
-- 一个非法 N3 设备文件：触发隔离与替换作废。
+- 一个非法 N3 设备文件：触发隔离与替换作废；
+- 保留/GC 夹具：连续发布 5 版并替换原件，覆盖旧版流式查询暂停、租约保护下
+  清理其它废弃版本与 blob、未发布分区/活动写租约/不明归属 blob 保护，以及
+  注入删除中断后的日志续跑。
 
 可通过 `python3 -I recon_cli.py demo --keep` 保留生成的目录人工检查。

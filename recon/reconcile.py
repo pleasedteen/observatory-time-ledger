@@ -246,6 +246,7 @@ def _collect_lineage(component, device_refs, project_refs,
             records.append({
                 "source": "device",
                 "source_path": rec.get("_source_path"),
+                "blob_sha": rec.get("_blob_sha"),
                 "location": rec.get("_line"),
                 "ref": list(ref),
             })
@@ -258,8 +259,14 @@ def _collect_lineage(component, device_refs, project_refs,
             records.append({
                 "source": "ledger",
                 "source_path": rec.get("_source_path"),
+                "blob_sha": rec.get("_blob_sha"),
                 "location": rec.get("_row"),
                 "ref": list(ref),
             })
 
-    return {"files": sorted(seen_files), "records": records}
+    lineage = {"files": sorted(seen_files), "records": records}
+    blob_shas = sorted({r.get("blob_sha") for r in records
+                        if r.get("blob_sha")})
+    if blob_shas:
+        lineage["blob_shas"] = blob_shas
+    return lineage

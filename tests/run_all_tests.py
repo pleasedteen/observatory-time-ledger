@@ -21,6 +21,8 @@ from recon.parsers import parse_device, parse_schedule, parse_ledger
 from recon.pipeline import Pipeline, IngestionReport
 from recon.query import QueryService
 from recon.storage import Lake
+from recon.retention import run_retention
+import recon.retention as retention_mod
 
 PASS = 0
 
@@ -211,12 +213,184 @@ def test_lifecycle():
     shutil.rmtree(work, ignore_errors=True)
 
 
+def test_retention_gc():
+    print("[retention / unreferenced-data reclamation]")
+    work = tempfile.mkdtemp()
+    try:
+        lake = Lake(os.path.join(work, "lake"))
+        pipe = Pipeline(lake, {"DEV-A": "R-A"})
+        src = os.path.join(work, "inputs")
+        os.makedirs(src, exist_ok=True)
+
+        schedule_path = os.path.join(src, "schedule.jsonl")
+        with open(schedule_path, "w", encoding="utf-8") as f:
+            f.write('{"project":"ALPHA","receivers":["R-A"],'
+                    '"nights":["N1"]}\n')
+        rep = IngestionReport("schedule")
+        pipe.ingest("schedule", "N1", schedule_path, "schedule", rep)
+
+        ledger_path = os.path.join(src, "ledger.parquet")
+        pq.write_table(ledger_path, {
+            "project": ["ALPHA"],
+            "settlement_period": ["P1"],
+            "night": ["N1"],
+            "occupy_ms": [1000],
+        })
+        rep = IngestionReport("ledger")
+        pipe.ingest("ledger", "P1", ledger_path, "ledger", rep)
+
+        device_path = os.path.join(src, "device.csv")
+        device_shas = []
+        for i in range(5):
+            # The extra batch column changes bytes/blob without changing the
+            # reconciled business result.
+            with open(device_path, "w", encoding="utf-8") as f:
+                f.write("night,receiver_code,occupied_seconds,batch\n")
+                f.write(f"N1,DEV-A,1,release-{i}\n")
+            rep = IngestionReport(f"device-{i}")
+            parsed = pipe.ingest("device", "N1", device_path,
+                                 f"device-{i}", rep)
+            check(parsed is not None, f"retention fixture ingest {i} accepted")
+            device_shas.append(rep.accepted[-1][2])
+            pipe.rerun(note=f"release-{i + 1}")
+
+        check(lake.list_version_ids() == [1, 2, 3, 4, 5],
+              "five published releases exist for retention fixture")
+
+        # Pause a reader on the oldest release and start streaming its rows.
+        old = lake.open_snapshot(1)
+        old_groups = old.list_groups()
+        old_rows = old.query_pairs()
+        paused_iter = old.iter_pairs()
+        first_row = next(paused_iter)
+        check(old.version_id == 1 and len(old_groups) == 1
+              and len(old_rows) == 1 and first_row["pair"] == "ALPHA|R-A|N1",
+              "reader opened and paused on old v1 snapshot")
+
+        # A newly received replacement has not been rerun/published yet.
+        with open(device_path, "w", encoding="utf-8") as f:
+            f.write("night,receiver_code,occupied_seconds,batch\n")
+            f.write("N1,DEV-A,1,unpublished\n")
+        rep = IngestionReport("unpublished")
+        pipe.ingest("device", "N1", device_path, "unpublished", rep)
+        unpublished_sha = rep.accepted[-1][2]
+
+        # An unregistered/manually placed old original has unknown ownership.
+        unknown_sha, unknown_path = lake.store_blob(b"orphan with no attribution")
+
+        plan = run_retention(lake, keep_versions=2, dry_run=True)
+        check(plan["candidate_versions"] == [2, 3],
+              "dry-run plans only versions outside the newest two")
+        check(os.path.isdir(lake.version_dir(2)),
+              "dry-run does not delete planned snapshots")
+
+        # Interrupt after physically removing the first planned snapshot.
+        real_remove = retention_mod._remove_path
+        interrupted = {}
+
+        def remove_after_v2(path):
+            real_remove(path)
+            if os.path.basename(os.path.normpath(path)) == "v2":
+                interrupted["happened"] = True
+                raise RuntimeError("simulated cleanup interruption")
+
+        retention_mod._remove_path = remove_after_v2
+        try:
+            run_retention(lake, keep_versions=2)
+        except RuntimeError:
+            pass
+        finally:
+            retention_mod._remove_path = real_remove
+
+        check(interrupted.get("happened") is True,
+              "fixture injected a cleanup interruption after v2")
+        check(not os.path.exists(lake.version_dir(2))
+              and os.path.isdir(lake.version_dir(3))
+              and os.path.isdir(lake.version_dir(1)),
+              "interruption leaves partial cleanup while pinned v1 survives")
+
+        # A second offline run must reconcile the journal and continue.
+        report = run_retention(lake, keep_versions=2)
+        check(report["status"] == "ok", "interrupted retention run resumes")
+        check(not os.path.exists(lake.version_dir(2))
+              and not os.path.exists(lake.version_dir(3)),
+              "resumed cleanup removes remaining obsolete snapshot")
+        check(os.path.isdir(lake.version_dir(1)),
+              "paused old snapshot remains available during cleanup")
+
+        # The paused stream and fresh reads of the old snapshot finish.
+        check(list(paused_iter) == [], "paused old-version iterator runs to end")
+        after_rows = old.query_pairs()
+        check(len(after_rows) == 1
+              and after_rows[0]["pair"] == old_rows[0]["pair"],
+              "old version query still completes after other data is reclaimed")
+
+        check(not os.path.exists(lake.blob_path(device_shas[1]))
+              and not os.path.exists(lake.blob_path(device_shas[2])),
+              "confirmed unreferenced originals from deleted releases reclaimed")
+        check(os.path.exists(lake.blob_path(device_shas[0])),
+              "original used by paused old release protected")
+        check(os.path.exists(lake.blob_path(device_shas[3]))
+              and os.path.exists(lake.blob_path(device_shas[4])),
+              "originals used by retained releases protected")
+        check(os.path.exists(lake.blob_path(unpublished_sha)),
+              "received but unpublished partition blob protected")
+        check(os.path.exists(unknown_path) and unknown_sha in report["unknown_blobs"],
+              "unattributed old original retained")
+
+        # Once the old query closes, the extra pin is released and a later
+        # retention pass can reclaim that snapshot and its unique blob.
+        old.close()
+        run_retention(lake, keep_versions=2)
+        check(not os.path.exists(lake.version_dir(1))
+              and not os.path.exists(lake.blob_path(device_shas[0])),
+              "closed old snapshot becomes reclaimable")
+        check(os.path.exists(unknown_path),
+              "unknown-attribution original remains after reader closes")
+
+        # An active write lease on one known obsolete blob protects it while
+        # retention still completes and protects the newest unpublished blob.
+        with open(device_path, "w", encoding="utf-8") as f:
+            f.write("night,receiver_code,occupied_seconds,batch\n")
+            f.write("N1,DEV-A,1,write-lock-1\n")
+        rep_w1 = IngestionReport("write-1")
+        pipe.ingest("device", "N1", device_path, "write-1", rep_w1)
+        write_locked_sha = rep_w1.accepted[-1][2]
+
+        with open(device_path, "w", encoding="utf-8") as f:
+            f.write("night,receiver_code,occupied_seconds,batch\n")
+            f.write("N1,DEV-A,1,write-lock-2\n")
+        rep_w2 = IngestionReport("write-2")
+        pipe.ingest("device", "N1", device_path, "write-2", rep_w2)
+        write_current_sha = rep_w2.accepted[-1][2]
+
+        with lake.write_lease("blob", write_locked_sha):
+            locked_report = run_retention(lake, keep_versions=2)
+            check(os.path.exists(lake.blob_path(write_locked_sha)),
+                  "blob with an active write lease protected")
+            check(write_locked_sha in locked_report["protected_blobs"],
+                  "retention plan records write-protected blob")
+        check(os.path.exists(lake.blob_path(write_current_sha)),
+              "newest received partition remains protected during write test")
+        run_retention(lake, keep_versions=2)
+        check(not os.path.exists(lake.blob_path(write_locked_sha)),
+              "released write-lease blob can then be reclaimed")
+        check(os.path.exists(lake.blob_path(write_current_sha)),
+              "current received blob remains after later retention")
+
+        check(len(QueryService(lake).query_pairs()) == 1,
+              "current published version remains queryable after retention")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     t0 = time.time()
     test_parquet()
     test_maxflow()
     test_parsers()
     test_lifecycle()
+    test_retention_gc()
     print(f"\nALL TESTS PASSED in {time.time() - t0:.2f}s ({PASS} assertions)")
 
 

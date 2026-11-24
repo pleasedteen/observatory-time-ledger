@@ -83,8 +83,29 @@ JSON 对象 `{设备代码: 规范接收机}`，或对象数组
 ### 6.4 SQLite `state.db`
 
 - `ingests(source, partition)`：当前生效分区的 blob、来源路径、字节数、接入时间、run。
+- `ingest_history`：每次被接受的整批替换及其 blob 归属；旧 blob 被替换后仍可确认来源。
 - `runs(run_id)`：运行生命周期。
 - `group_versions(group_id, version_id)`：每组的输入/结果哈希与血缘版本。
+- `version_blobs(version_id, blob_sha)`：发布版引用的原件 blob。
+- `leases`：暂停读、进行中写的租约（含 PID/过期时间），与 `locks/` 下的 `flock` 配合。
+- `gc_runs/gc_items`：保留/回收计划和可恢复删除进度。
+
+### 6.5 保留与回收报告
+
+`retention` / `gc` 返回 JSON 报告，常用字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `keep_versions` | 最近保留数量 |
+| `recent_versions` / `protected_versions` | 最近版本及因 current/租约额外保护的版本 |
+| `pinned_versions` | 活动读/版本写租约固定的版本 |
+| `candidate_versions` / `deleted_versions` | 待删/已删旧快照 |
+| `protected_blobs` | 当前分区、保留版血缘和活动租约引用的 blob |
+| `unpublished_blobs` | 当前 `ingests` 中尚未出现在当前发布清单的 blob |
+| `candidate_blobs` / `deleted_blobs` | 来源明确且无引用、待删/已删原件副本 |
+| `unknown_blobs` / `kept_unknown_blobs` | 归属不明、按要求保留的旧原件 |
+| `gc_id` / `resumed_gc_runs` | 本次 GC 日志及续跑的中断日志 |
+| `bytes_freed` | 回收字节数（删除前统计） |
 
 ## 7. 状态语义
 

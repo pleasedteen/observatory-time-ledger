@@ -133,6 +133,22 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
+def cmd_retention(args) -> int:
+    from .retention import run_retention
+    keep = args.keep_versions
+    if keep is None:
+        keep = args.keep_positional
+    if keep is None:
+        keep = 3
+    report = run_retention(
+        Lake(args.lake),
+        keep_versions=keep,
+        dry_run=bool(args.dry_run),
+    )
+    _print(report)
+    return 0 if report.get("status") in ("ok", "dry_run", "planned") else 1
+
+
 def cmd_demo(args) -> int:
     """Build offline fixtures into a fresh temp lake and run the full flow."""
     from .selftest import run_demo
@@ -191,6 +207,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     pss = sub.add_parser("snapshot", help="current published version manifest")
     pss.set_defaults(func=cmd_snapshot)
+
+    for command_name in ("retention", "gc", "cleanup", "retain"):
+        prt = sub.add_parser(
+            command_name,
+            help="keep recent releases and reclaim unreferenced snapshots/blobs")
+        prt.add_argument("keep_positional", nargs="?", type=int,
+                         help="number of recent versions to keep")
+        prt.add_argument("--lake", default=argparse.SUPPRESS,
+                         help="lake root (may also be passed before command)")
+        prt.add_argument("--keep", "--keep-versions", "--retain",
+                         "--retain-versions", "--versions", "--count",
+                         "--recent", "-n",
+                         dest="keep_versions", type=int, default=None,
+                         help="number of recent published versions to keep")
+        prt.add_argument("--dry-run", action="store_true",
+                         help="report reclaimable data without deleting it")
+        prt.set_defaults(func=cmd_retention)
 
     pd = sub.add_parser("demo", help="offline end-to-end demonstration")
     pd.add_argument("--keep", action="store_true",
